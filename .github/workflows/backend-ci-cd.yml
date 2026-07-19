@@ -1,0 +1,100 @@
+name: Backend CI/CD
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - "k8s/**"
+      - ".github/workflows/backend-ci-cd.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  security-events: write
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  EKS_CLUSTER_NAME: starttech-cluster
+  ECR_REPOSITORY: starttech-backend-api
+
+jobs:
+  test-build-scan-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+          cache-dependency-path: backend/go.sum
+
+      - name: Run Go tests
+        working-directory: backend
+        run: go test ./...
+
+      - name: Build image
+        run: docker build --tag "backend-api:${GITHUB_SHA}" backend
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: backend-api:${{ github.sha }}
+          format: table
+          exit-code: "1"
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.AWS_APPLICATION_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Authenticate to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Push SHA-tagged image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          docker tag "backend-api:${GITHUB_SHA}" "${ECR_REGISTRY}/${ECR_REPOSITORY}:${GITHUB_SHA}"
+          docker push "${ECR_REGISTRY}/${ECR_REPOSITORY}:${GITHUB_SHA}"
+
+      - name: Connect to EKS
+        run: aws eks update-kubeconfig --name "${EKS_CLUSTER_NAME}" --region "${AWS_REGION}"
+
+      - name: Create runtime configuration
+        env:
+          MONGO_URI: ${{ secrets.MONGO_URI }}
+          JWT_SECRET_KEY: ${{ secrets.JWT_SECRET_KEY }}
+          CLOUDFRONT_DOMAIN: ${{ vars.CLOUDFRONT_DOMAIN }}
+        run: |
+          REDIS_HOST="$(aws elasticache describe-cache-clusters --cache-cluster-id starttech-redis --show-cache-node-info --query 'CacheClusters[0].CacheNodes[0].Endpoint.Address' --output text)"
+          kubectl create configmap backend-config \
+            --from-literal=PORT=8080 \
+            --from-literal=DB_NAME=much_todo_db \
+            --from-literal=ENABLE_CACHE=true \
+            --from-literal=REDIS_HOST="${REDIS_HOST}" \
+            --from-literal=REDIS_PORT=6379 \
+            --from-literal=LOG_LEVEL=INFO \
+            --from-literal=LOG_FORMAT=json \
+            --from-literal=SECURE_COOKIE=true \
+            --from-literal=ALLOWED_ORIGINS="https://${CLOUDFRONT_DOMAIN}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl create secret generic backend-secrets \
+            --from-literal=MONGO_URI="${MONGO_URI}" \
+            --from-literal=JWT_SECRET_KEY="${JWT_SECRET_KEY}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Update deployment image and apply manifests
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          sed -i "s|starttech-backend-api:latest|${ECR_REGISTRY}/${ECR_REPOSITORY}:${GITHUB_SHA}|" k8s/deployment.yaml
+          kubectl apply -f k8s/
+
+      - name: Verify rollout
+        run: kubectl rollout status deployment/backend-api --timeout=5m

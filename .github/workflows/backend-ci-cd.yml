@@ -38,7 +38,7 @@ jobs:
         run: docker build --tag "backend-api:${GITHUB_SHA}" backend
 
       - name: Scan image with Trivy
-        uses: aquasecurity/trivy-action@0.33.1
+        uses: aquasecurity/trivy-action@0.28.0
         with:
           image-ref: backend-api:${{ github.sha }}
           format: table

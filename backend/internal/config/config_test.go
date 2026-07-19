@@ -2,6 +2,26 @@ package config
 
 import "testing"
 
+func TestLoadConfigReadsEnvironment(t *testing.T) {
+	t.Setenv("MONGO_URI", "mongodb+srv://database.example/test")
+	t.Setenv("JWT_SECRET_KEY", "test-signing-key")
+	t.Setenv("REDIS_HOST", "redis.example")
+
+	config, err := LoadConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+	if config.MongoURI != "mongodb+srv://database.example/test" {
+		t.Fatalf("MongoURI = %q, expected environment value", config.MongoURI)
+	}
+	if config.JWTSecretKey != "test-signing-key" {
+		t.Fatalf("JWTSecretKey = %q, expected environment value", config.JWTSecretKey)
+	}
+	if config.RedisHost != "redis.example" {
+		t.Fatalf("RedisHost = %q, expected environment value", config.RedisHost)
+	}
+}
+
 func TestRedisAddress(t *testing.T) {
 	tests := []struct {
 		name     string
